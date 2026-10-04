@@ -1,0 +1,1648 @@
+#!/usr/bin/env bash
+# a "simple" ports-based package manager
+# v1.0.1
+#
+# requires bash 4.4+ (associative arrays, mapfile, [[ ]], process substitution)
+#
+# layout summary
+# --- 
+# ports tree (one or more, searched in $PORTS_PATH order):
+#   <tree>/<category>/<name>/
+#     port          build script: metadata + build() + install()
+#     depends       optional: runtime deps, one per line
+#     builddeps     optional: build-only deps, one per line
+#     env           optional: env vars sourced inside build context
+#     patches/      optional: *.patch applied after extract, in sort order
+#     dist/         cached source tarball (auto)
+#     work/         extracted source; build() runs here (auto)
+#
+# state under $DB_DIR:
+#   installed/<pkg>/{version,files,sums,modes,build-env}
+#   pkg/<name>-<version>.tar.gz + matching metadata dir
+#   world, pinned, alternatives, alternatives.want, history
+#   logs/<pkg>-<version>-<ts>.log
+#   .lock, .tree-frozen
+#
+# config: $BND_CONF (default /etc/bnd.conf)
+#   CFLAGS CXXFLAGS LDFLAGS MAKEJOBS
+#   BND_BUILD_USER            drop build() to this user when running as root
+#   BND_HOOK                  hook script: $BND_HOOK <phase> <pkg>
+#   BND_CCACHE=1              prepend ccache to CC/CXX
+#   BND_SANDBOX=bwrap         sandbox build() with bubblewrap
+#   BND_SANDBOX_ISOLATE_NET=1 also unshare network inside the sandbox
+
+set -euo pipefail
+
+BND_VER="1.0.1"
+
+# --- constants ---
+PORTS_PATH="${PORTS_PATH:-/usr/ports}"
+DB_DIR="${DB_DIR:-/var/db/bnd}"
+BND_ROOT="${BND_ROOT:-/}"
+BND_CONF="${BND_CONF:-/etc/bnd.conf}"
+
+INSTALLED_DB="$DB_DIR/installed"
+PKG_DB="$DB_DIR/pkg"
+LOGS_DIR="$DB_DIR/logs"
+WORLD="$DB_DIR/world"
+PINNED="$DB_DIR/pinned"
+ALT="$DB_DIR/alternatives"
+ALT_WANT="$DB_DIR/alternatives.want"
+HISTORY="$DB_DIR/history"
+LOCK_FILE="$DB_DIR/.lock"
+TREE_FROZEN="$DB_DIR/.tree-frozen"
+
+DRY_RUN=0
+_LOCK_HELD=0
+
+# caches
+declare -A _port_dir_cache=()
+declare -A _bnd_inflight=()
+declare -A _rdeps_index=()
+declare -A _newfile_set=()
+_RDEPS_BUILT=0
+_SHA_TOOL=""
+
+# colors
+grn=$'\e[32m'; ylw=$'\e[33m'; red=$'\e[31m'; cyn=$'\e[36m'; rst=$'\e[0m'
+msg()  { printf '%s==>%s %s\n' "$grn" "$rst" "$*" >&2; }
+warn() { printf '%s==>%s %s\n' "$ylw" "$rst" "$*" >&2; }
+die()  { printf '%s==>%s %s\n' "$red" "$rst" "$*" >&2; exit 1; }
+
+# --- usage ---
+usage() {
+	cat <<EOF
+bnd $BND_VER - boundary package manager
+
+usage: bnd [--root <dir>] [--dry-run] <command> [args]
+
+query:
+  list                 list installed packages (* = pinned)
+  info    <pkg>        info about an installed package
+  flags   <pkg>        recorded build flags for a package
+  provides <path>      which package owns a path
+  why     <pkg>        reverse dependencies of an installed package
+  orphans              installed packages nothing needs
+  graph   <pkg>        dependency tree
+  rgraph  <pkg>        reverse dependency tree
+  diff    <pkg>        installed vs available version
+  history [--pkg <p>]  install/remove/upgrade log
+  search  [q]          search the ports tree
+  tree                 show ports tree info
+
+install/upgrade:
+  install <pkg>        build tarball if needed, then install
+  build   <pkg>        build a package tarball (no root needed)
+  reinstall <pkg>      force rebuild + reinstall
+  upgrade [<pkg>]      rebuild+reinstall one package or @world
+  upgrade -f           rebuild all, ignore pins and port-hash
+  remove  [-f] <pkg>   uninstall (refuses if dependents exist)
+
+pinning:
+  pin     <pkg>        prevent bulk upgrade from touching a package
+  unpin   <pkg>        undo pin
+
+alternatives:
+  provide <path> <pkg> make pkg the provider of path
+  unprovide <path>     drop a manual alternative
+
+maintenance:
+  verify  [<pkg>]      check for drift (missing or modified files)
+  doctor  [--fix]      check state consistency
+  depclean             remove all orphans
+  clean   [-a|<pkg>]   wipe work/, dist/, and built tarball
+  lint    [-a|<pkg>]   static check a port
+  new     <cat>/<name> create a starter port
+
+tree:
+  sync [--commit C] [--freeze|--unfreeze]   update ports tree
+
+other:
+  help                 this message
+
+options:
+  --root <dir>         install to a fake root (KISS_ROOT equivalent)
+  --dry-run            print what would happen, change nothing
+
+config: $BND_CONF
+  CFLAGS CXXFLAGS LDFLAGS MAKEJOBS
+  BND_BUILD_USER BND_HOOK BND_CCACHE BND_SANDBOX BND_SANDBOX_ISOLATE_NET
+EOF
+}
+
+# --- utilities ---
+_cpu_count() {
+	if command -v nproc >/dev/null 2>&1; then nproc
+	elif command -v sysctl >/dev/null 2>&1; then sysctl -n hw.ncpu 2>/dev/null || echo 1
+	else echo 1; fi
+}
+
+# detect sha tool once at startup; see load_conf
+_init_sha_tool() {
+	if command -v sha256sum >/dev/null 2>&1; then _SHA_TOOL="sha256sum"
+	elif command -v shasum >/dev/null 2>&1; then _SHA_TOOL="shasum"
+	else _SHA_TOOL="none"; fi
+}
+
+_sha256_of() {
+	local f="$1"
+	case "$_SHA_TOOL" in
+		sha256sum) sha256sum "$f" | awk '{print $1}';;
+		shasum)    shasum -a 256 "$f" | awk '{print $1}';;
+		*)         echo "NOSHA";;
+	esac
+}
+
+_sha256_stdin() {
+	case "$_SHA_TOOL" in
+		sha256sum) sha256sum | awk '{print $1}';;
+		shasum)    shasum -a 256 | awk '{print $1}';;
+		*)         echo "NOSHA";;
+	esac
+}
+
+_sha256_check() {
+	local expected="$1" file="$2"
+	case "$_SHA_TOOL" in
+		sha256sum) printf '%s  %s\n' "$expected" "$file" | sha256sum -c - >/dev/null;;
+		shasum)    printf '%s  %s\n' "$expected" "$file" | shasum -a 256 -c - >/dev/null;;
+		*)         warn "no sha256 tool, skipping checksum"; return 0;;
+	esac
+}
+
+_iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+_stat_mode() {
+	local f="$1"
+	stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null || echo 644
+}
+
+_read_list_file() {
+	local f="$1" line
+	[ -f "$f" ] || return 0
+	while IFS= read -r line; do
+		line="${line%%#*}"
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		[ -n "$line" ] && printf '%s\n' "$line"
+	done < "$f"
+	return 0
+}
+
+all_port_dirs() {
+	local tree
+	local -a trees
+	IFS=':' read -ra trees <<< "$PORTS_PATH"
+	for tree in "${trees[@]}"; do
+		[ -d "$tree" ] || continue
+		find "$tree" -mindepth 2 -maxdepth 2 -type d 2>/dev/null
+	done
+}
+
+# --- config ---
+load_conf() {
+	local e_cflags="${CFLAGS-__UNSET__}" e_cxx="${CXXFLAGS-__UNSET__}"
+	local e_ldflags="${LDFLAGS-__UNSET__}" e_jobs="${MAKEJOBS-__UNSET__}"
+
+	CFLAGS="-O2 -pipe"; CXXFLAGS="-O2 -pipe"; LDFLAGS=""
+	MAKEJOBS="$(_cpu_count)"
+
+	if [ -f "$BND_CONF" ]; then
+		# shellcheck disable=SC1090
+		. "$BND_CONF" || die "cannot read config: $BND_CONF"
+	fi
+
+	[ "$e_cflags"  = "__UNSET__" ] || CFLAGS="$e_cflags"
+	[ "$e_cxx"     = "__UNSET__" ] || CXXFLAGS="$e_cxx"
+	[ "$e_ldflags" = "__UNSET__" ] || LDFLAGS="$e_ldflags"
+	[ "$e_jobs"    = "__UNSET__" ] || MAKEJOBS="$e_jobs"
+
+	export CFLAGS CXXFLAGS LDFLAGS MAKEJOBS
+	export MAKEFLAGS="-j$MAKEJOBS"
+
+	_init_sha_tool
+
+	if [ "${BND_CCACHE:-0}" = "1" ] && command -v ccache >/dev/null 2>&1; then
+		export CC="ccache ${CC:-cc}"
+		export CXX="ccache ${CXX:-c++}"
+	fi
+
+	if [ -n "${BND_BUILD_USER:-}" ] && ! id "$BND_BUILD_USER" >/dev/null 2>&1; then
+		die "BND_BUILD_USER=$BND_BUILD_USER does not exist"
+	fi
+}
+
+# --- state helpers ---
+need_root() {
+	[ -n "$BND_ROOT" ] && return 0
+	[ "$(id -u)" -eq 0 ] || die "root required"
+}
+
+init_dirs() {
+	mkdir -p "$DB_DIR" "$INSTALLED_DB" "$PKG_DB" "$LOGS_DIR"
+	touch "$WORLD" "$PINNED" "$ALT" "$ALT_WANT" "$HISTORY"
+}
+
+# idempotent: safe to call from nested commands
+acquire_lock() {
+	[ "$_LOCK_HELD" = 1 ] && return 0
+	if ! command -v flock >/dev/null 2>&1; then
+		warn "flock missing, no locking"
+		_LOCK_HELD=1
+		return 0
+	fi
+	exec 9>"$LOCK_FILE"
+	if ! flock -n 9; then
+		msg "waiting for another bnd to finish (up to 5min)"
+		flock -w 300 9 || die "another bnd is running (lock: $LOCK_FILE)"
+	fi
+	_LOCK_HELD=1
+}
+
+log_history() {
+	local action="$1" pkg="$2" detail="${3:-}"
+	[ -d "$DB_DIR" ] || return 0
+	printf '%s\t%s\t%s\t%s\n' "$(_iso_now)" "$action" "$pkg" "$detail" >> "$HISTORY"
+}
+
+# --- port lookup ---
+find_port_quiet() {
+	local n="$1" d
+	local -a trees
+	if [ -n "${_port_dir_cache[$n]:-}" ]; then
+		printf '%s\n' "${_port_dir_cache[$n]}"
+		return 0
+	fi
+	IFS=':' read -ra trees <<< "$PORTS_PATH"
+	local tree
+	for tree in "${trees[@]}"; do
+		[ -d "$tree" ] || continue
+		d=$(find "$tree" -mindepth 2 -maxdepth 2 -type d -name "$n" 2>/dev/null | head -n1) || true
+		if [ -n "$d" ]; then
+			_port_dir_cache[$n]="$d"
+			printf '%s\n' "$d"
+			return 0
+		fi
+	done
+	return 1
+}
+
+find_port() {
+	local n="$1" d
+	d=$(find_port_quiet "$n") || die "port not found: $n"
+	printf '%s\n' "$d"
+}
+
+# --- port loading ---
+load_port() {
+	local dir="$1"
+	port_dir="$dir"
+	name="" version="0" source="" sha256="" depends=() builddeps=()
+	unset -f build install 2>/dev/null || true
+	# shellcheck disable=SC1090
+	. "$dir/port" || die "cannot load port: $dir"
+	[ -n "$name" ] || name=$(basename "$dir")
+	[ -f "$dir/depends" ]   && mapfile -t depends   < <(_read_list_file "$dir/depends") || true
+	[ -f "$dir/builddeps" ] && mapfile -t builddeps < <(_read_list_file "$dir/builddeps") || true
+	return 0
+}
+
+load_port_safe() {
+	local dir="$1"
+	port_dir="$dir"
+	name="" version="0" source="" sha256="" depends=() builddeps=()
+	unset -f build install 2>/dev/null || true
+	[ -f "$dir/port" ] || return 1
+	# shellcheck disable=SC1090
+	. "$dir/port" 2>/dev/null || return 1
+	[ -n "$name" ] || name=$(basename "$dir")
+	[ -f "$dir/depends" ]   && mapfile -t depends   < <(_read_list_file "$dir/depends") || true
+	[ -f "$dir/builddeps" ] && mapfile -t builddeps < <(_read_list_file "$dir/builddeps") || true
+	return 0
+}
+
+# hash of everything that affects the build output
+_port_hash() {
+	local dir="$1" f p
+	{
+		for f in port depends builddeps; do
+			if [ -f "$dir/$f" ]; then
+				printf '=== %s ===\n' "$f"
+				cat "$dir/$f"
+			fi
+		done
+		if [ -d "$dir/patches" ]; then
+			for p in "$dir"/patches/*; do
+				if [ -f "$p" ]; then
+					printf '=== patches/%s ===\n' "$(basename "$p")"
+					cat "$p"
+				fi
+			done
+		fi
+	} | _sha256_stdin
+}
+
+# --- state queries ---
+is_installed()  { [ -f "$INSTALLED_DB/$1/version" ]; }
+is_pinned()     { [ -f "$PINNED" ] && grep -qxF "$1" "$PINNED" 2>/dev/null; }
+in_world()      { [ -f "$WORLD" ] && grep -qxF "$1" "$WORLD" 2>/dev/null; }
+
+list_installed() {
+	[ -d "$INSTALLED_DB" ] || return 0
+	local d
+	for d in "$INSTALLED_DB"/*/; do
+		[ -d "$d" ] || continue
+		basename "$d"
+	done
+}
+
+# --- alternatives ---
+_alt_allows() {
+	local path="$1" pkg="$2"
+	[ -f "$ALT" ] && grep -qxF "$path $pkg" "$ALT" 2>/dev/null && return 0
+	[ -f "$ALT_WANT" ] && grep -qxF "$path $pkg" "$ALT_WANT" 2>/dev/null && return 0
+	return 1
+}
+
+_remove_from_owner() {
+	local owner="$1" path="$2"
+	local f="$INSTALLED_DB/$owner/files"
+	local s="$INSTALLED_DB/$owner/sums"
+	if [ -f "$f" ]; then
+		grep -vxF "$path" "$f" > "$f.tmp" || true
+		mv "$f.tmp" "$f"
+	fi
+	if [ -f "$s" ]; then
+		awk -v p="$path" '$2 != p' "$s" > "$s.tmp" || true
+		mv "$s.tmp" "$s"
+	fi
+}
+
+_set_alt() {
+	local path="$1" pkg="$2"
+	awk -v p="$path" '$1 != p' "$ALT" > "$ALT.tmp" 2>/dev/null || true
+	mv "$ALT.tmp" "$ALT"
+	printf '%s %s\n' "$path" "$pkg" >> "$ALT"
+}
+
+_clear_alts_for() {
+	local pkg="$1" f
+	for f in "$ALT" "$ALT_WANT"; do
+		[ -f "$f" ] || continue
+		awk -v p="$pkg" '$2 != p' "$f" > "$f.tmp" || true
+		mv "$f.tmp" "$f"
+	done
+}
+
+_promote_alts() {
+	local pkg="$1" path want_pkg
+	[ -f "$ALT_WANT" ] || return 0
+	while IFS=' ' read -r path want_pkg; do
+		[ "$want_pkg" = "$pkg" ] || continue
+		_set_alt "$path" "$pkg"
+	done < "$ALT_WANT"
+	awk -v p="$pkg" '$2 != p' "$ALT_WANT" > "$ALT_WANT.tmp" || true
+	mv "$ALT_WANT.tmp" "$ALT_WANT"
+}
+
+# --- reverse deps ---
+build_rdeps_index() {
+	[ "$_RDEPS_BUILT" = 1 ] && return 0
+	_RDEPS_BUILT=1
+	local p pdir dep
+	while IFS= read -r p; do
+		[ -n "$p" ] || continue
+		pdir=$(find_port_quiet "$p") || continue
+		load_port_safe "$pdir" || continue
+		for dep in "${depends[@]}"; do
+			_rdeps_index[$dep]="${_rdeps_index[$dep]:-} $p"
+		done
+	done < <(list_installed)
+	return 0
+}
+
+reverse_deps() {
+	local pkg="$1" p
+	build_rdeps_index
+	for p in ${_rdeps_index[$pkg]:-}; do
+		printf '%s\n' "$p"
+	done
+	return 0
+}
+
+_invalidate_rdeps() { _RDEPS_BUILT=0; _rdeps_index=(); }
+
+# --- conflicts ---
+all_owned_files_quiet() {
+	local p db f
+	while IFS= read -r p; do
+		db="$INSTALLED_DB/$p/files"
+		[ -f "$db" ] || continue
+		while IFS= read -r f; do
+			[ -n "$f" ] && printf '%s\t%s\n' "$p" "$f"
+		done < "$db"
+	done < <(list_installed)
+}
+
+resolve_conflicts() {
+	local newpkg="$1" newfiles="$2"
+	local f p db
+
+	_newfile_set=()
+	while IFS= read -r f; do
+		[ -n "$f" ] && _newfile_set[$f]=1
+	done < "$newfiles"
+
+	while IFS= read -r p; do
+		[ -n "$p" ] || continue
+		[ "$p" = "$newpkg" ] && continue
+		db="$INSTALLED_DB/$p/files"
+		[ -f "$db" ] || continue
+		while IFS= read -r f; do
+			[ -n "$f" ] || continue
+			[ -n "${_newfile_set[$f]:-}" ] || continue
+			if _alt_allows "$f" "$newpkg"; then
+				msg "taking over $f from $p"
+				[ "$DRY_RUN" = 1 ] || _remove_from_owner "$p" "$f"
+			else
+				die "file conflict: $f is owned by $p; use 'bnd provide $f $newpkg' to override"
+			fi
+		done < "$db"
+	done < <(list_installed)
+
+	_newfile_set=()
+	return 0
+}
+
+remove_stale_files() {
+	local pkg="$1" newfiles="$2" oldfiles="$INSTALLED_DB/$pkg/files" f
+	[ -f "$oldfiles" ] || return 0
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		grep -qxF "$f" "$newfiles" 2>/dev/null || rm -f "$BND_ROOT$f"
+	done < "$oldfiles"
+	return 0
+}
+
+# --- hooks ---
+run_hook() {
+	local phase="$1" pkg="$2"
+	[ -n "${BND_HOOK:-}" ] || return 0
+	[ -x "$BND_HOOK" ] || { warn "BND_HOOK not executable: $BND_HOOK"; return 0; }
+	"$BND_HOOK" "$phase" "$pkg" || warn "hook failed: $phase $pkg"
+}
+
+# --- source prep ---
+prepare_src() {
+	local work="$port_dir/work" marker="$work/.bnd-extracted"
+	if [ ! -f "$marker" ]; then
+		rm -rf "$work"; mkdir -p "$work"
+		if [ -n "$source" ]; then
+			mkdir -p "$port_dir/dist"
+			local tb="$port_dir/dist/$(basename "$source")"
+			if [ ! -f "$tb" ]; then
+				msg "fetching $source"
+				curl -fL --retry 3 -o "$tb" "$source" || die "fetch failed"
+			fi
+			if [ -n "$sha256" ]; then
+				_sha256_check "$sha256" "$tb" || die "checksum mismatch: $name-$version"
+			fi
+			msg "extracting $(basename "$tb")"
+			tar -xf "$tb" -C "$work" --strip-components=1
+		fi
+		if [ -d "$port_dir/patches" ]; then
+			local p
+			for p in "$port_dir"/patches/*.patch; do
+				[ -f "$p" ] || continue
+				msg "applying $(basename "$p")"
+				( cd "$work" && patch -p1 --no-backup-if-mismatch < "$p" ) \
+					|| die "patch failed: $(basename "$p")"
+			done
+		fi
+		: > "$marker"
+	fi
+	printf '%s\n' "$work"
+}
+
+# --- build phase ---
+_run_build_bwrap() {
+	local envfile="$1" portfile="$2" work="$3"
+	local home; home=$(mktemp -d "$DB_DIR/.buildhome.XXXXXX")
+	local rc=0
+
+	set +e
+	(
+		trap 'rm -rf "$home"' EXIT
+		local -a net_args=()
+		if [ "${BND_SANDBOX_ISOLATE_NET:-0}" = "1" ]; then
+			net_args=(--unshare-net)
+		fi
+		bwrap \
+			--ro-bind / / \
+			--bind "$work" "$work" \
+			--bind "$home" "$home" \
+			--dev /dev \
+			--proc /proc \
+			--tmpfs /tmp \
+			"${net_args[@]}" \
+			--chdir "$work" \
+			--setenv CFLAGS "$CFLAGS" \
+			--setenv CXXFLAGS "$CXXFLAGS" \
+			--setenv LDFLAGS "$LDFLAGS" \
+			--setenv MAKEJOBS "$MAKEJOBS" \
+			--setenv MAKEFLAGS "$MAKEFLAGS" \
+			--setenv HOME "$home" \
+			--setenv PATH "$PATH" \
+			bash -c '[ -f "$1" ] && . "$1"; . "$2"; if declare -F build >/dev/null; then build; fi' \
+				_ "$envfile" "$portfile"
+	)
+	rc=$?
+	set -e
+	return $rc
+}
+
+_run_build_user() {
+	local envfile="$1" portfile="$2" work="$3"
+	local wrapper home rc=0
+
+	wrapper=$(mktemp "$DB_DIR/.build-wrapper.sh.XXXXXX")
+	home=$(mktemp -d "$DB_DIR/.buildhome.XXXXXX")
+
+	{
+		printf '#!/usr/bin/env bash\n'
+		printf 'set -e\n'
+		printf 'if [ -f "$1" ]; then . "$1"; fi\n'
+		printf '. "$2"\n'
+		printf 'if declare -F build >/dev/null; then build; fi\n'
+	} > "$wrapper"
+	chmod +x "$wrapper"
+
+	chown -R "$BND_BUILD_USER" "$work" "$home" 2>/dev/null || true
+
+	if command -v runuser >/dev/null 2>&1; then
+		( cd "$work" && runuser -u "$BND_BUILD_USER" -- env \
+			CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS" LDFLAGS="$LDFLAGS" \
+			MAKEJOBS="$MAKEJOBS" MAKEFLAGS="$MAKEFLAGS" HOME="$home" \
+			"$wrapper" "$envfile" "$portfile" ) || rc=$?
+	elif command -v sudo >/dev/null 2>&1; then
+		( cd "$work" && sudo -u "$BND_BUILD_USER" env \
+			CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS" LDFLAGS="$LDFLAGS" \
+			MAKEJOBS="$MAKEJOBS" MAKEFLAGS="$MAKEFLAGS" HOME="$home" \
+			"$wrapper" "$envfile" "$portfile" ) || rc=$?
+	else
+		warn "no runuser/sudo; running build as root"
+		(
+			[ -f "$envfile" ] && . "$envfile"
+			cd "$work"
+			. "$portfile"
+			if declare -F build >/dev/null; then build; fi
+		) || rc=$?
+	fi
+
+	rm -rf "$home" "$wrapper"
+	return $rc
+}
+
+_run_build_phase() {
+	local portdir="$1" work="$2"
+	local envfile="$portdir/env"
+	local portfile="$portdir/port"
+	local rc=0
+
+	if [ "${BND_SANDBOX:-}" = "bwrap" ]; then
+		if command -v bwrap >/dev/null 2>&1; then
+			_run_build_bwrap "$envfile" "$portfile" "$work" || rc=$?
+			return $rc
+		fi
+		warn "bwrap not found, running unsandboxed"
+	fi
+
+	if [ -n "${BND_BUILD_USER:-}" ] && [ "$(id -u)" -eq 0 ]; then
+		_run_build_user "$envfile" "$portfile" "$work" || rc=$?
+		return $rc
+	fi
+
+	(
+		[ -f "$envfile" ] && . "$envfile"
+		cd "$work"
+		. "$portfile"
+		if declare -F build >/dev/null; then build; fi
+	) || rc=$?
+	return $rc
+}
+
+# --- build package ---
+build_package() {
+	local dir="$1" work dest meta out tarball
+	load_port "$dir"
+	run_hook pre-build "$name"
+
+	local phash; phash=$(_port_hash "$dir")
+
+	work=$(prepare_src)
+	dest=$(mktemp -d)
+	meta=$(mktemp -d)
+
+	local logfile="$LOGS_DIR/$name-$version-$(_iso_now | tr ':' '-').log"
+	msg "log: $logfile"
+
+	if declare -F build >/dev/null; then
+		msg "building $name-$version (j$MAKEJOBS${BND_BUILD_USER:+ as $BND_BUILD_USER})"
+		if ! _run_build_phase "$dir" "$work" > "$logfile" 2>&1; then
+			rm -rf "$dest" "$meta"
+			warn "build failed, last 30 lines of $logfile:"
+			tail -n 30 "$logfile" >&2 || true
+			die "build failed: $name"
+		fi
+	fi
+
+	if declare -F install >/dev/null; then
+		export DESTDIR="$dest"
+		if ! ( cd "$work" && . "$dir/port" && install ) >> "$logfile" 2>&1; then
+			rm -rf "$dest" "$meta"; unset DESTDIR
+			warn "install failed, last 30 lines of $logfile:"
+			tail -n 30 "$logfile" >&2 || true
+			die "install failed: $name"
+		fi
+		unset DESTDIR
+	else
+		warn "$name has no install(), recording as empty"
+	fi
+
+	( cd "$dest" && find . \( -type f -o -type l \) -print ) \
+		| sed 's|^\./|/|' > "$meta/files"
+
+	: > "$meta/sums"
+	: > "$meta/modes"
+	local f rel h
+	while IFS= read -r -d '' f; do
+		rel="${f#$dest}"
+		h=$(_sha256_of "$f")
+		printf '%s  %s\n' "$h" "$rel" >> "$meta/sums"
+		printf '%s  %s\n' "$(_stat_mode "$f")" "$rel" >> "$meta/modes"
+	done < <(find "$dest" -type f -print0)
+
+	{
+		printf 'CFLAGS=%s\n'    "$CFLAGS"
+		printf 'CXXFLAGS=%s\n'  "$CXXFLAGS"
+		printf 'LDFLAGS=%s\n'   "$LDFLAGS"
+		printf 'MAKEJOBS=%s\n'  "$MAKEJOBS"
+		printf 'port-hash=%s\n' "$phash"
+		printf 'built=%s\n'     "$(_iso_now)"
+	} > "$meta/build-env"
+
+	out="$PKG_DB/$name-$version"
+	mkdir -p "$out"
+	tarball="$out.tar.gz"
+	tar -C "$dest" -czf "$tarball" .
+	cp "$meta/files" "$meta/sums" "$meta/modes" "$meta/build-env" "$out/"
+
+	rm -rf "$dest" "$meta"
+	run_hook post-build "$name"
+	msg "packaged $name-$version -> $tarball"
+}
+
+# --- merge stage ---
+_merge_stage() {
+	local stage="$1" pkg="$2" is_upgrade="$3" out_files="$4" out_sums="$5" out_modes="$6"
+	local old_sums="$INSTALLED_DB/$pkg/sums"
+	local f rel target h m
+	: > "$out_files"; : > "$out_sums"; : > "$out_modes"
+
+	while IFS= read -r -d '' f; do
+		rel="${f#$stage}"
+		target="${BND_ROOT}${rel}"
+
+		if [ -d "$f" ] && [ ! -L "$f" ]; then
+			[ "$DRY_RUN" = 1 ] || mkdir -p "$target"
+			continue
+		fi
+
+		if [ "$is_upgrade" = "1" ] && [[ "$rel" == /etc/* ]] && [ -e "$target" ]; then
+			local cur_h new_h old_h
+			cur_h=$(_sha256_of "$target")
+			new_h=$(_sha256_of "$f")
+			old_h=""
+			[ -f "$old_sums" ] && old_h=$(awk -v p="$rel" '$2 == p { print $1; exit }' "$old_sums")
+			if [ "$cur_h" != "$new_h" ] && [ "$cur_h" != "$old_h" ]; then
+				[ "$DRY_RUN" = 1 ] || cp -a "$f" "$target.bndnew"
+				warn "config differs, saved as ${rel}.bndnew"
+				printf '%s\n' "${rel}.bndnew" >> "$out_files"
+				h=$(_sha256_of "$f")
+				printf '%s  %s\n' "$h" "${rel}.bndnew" >> "$out_sums"
+				printf '%s  %s\n' "644" "${rel}.bndnew" >> "$out_modes"
+				continue
+			fi
+		fi
+
+		[ "$DRY_RUN" = 1 ] || mkdir -p "$(dirname "$target")"
+		[ "$DRY_RUN" = 1 ] || cp -a "$f" "$target"
+		printf '%s\n' "$rel" >> "$out_files"
+		if [ -f "$f" ] && [ ! -L "$f" ]; then
+			h=$(_sha256_of "$f")
+			m=$(_stat_mode "$f")
+			printf '%s  %s\n' "$h" "$rel" >> "$out_sums"
+			printf '%s  %s\n' "$m" "$rel" >> "$out_modes"
+		fi
+	done < <(find "$stage" -mindepth 1 -print0)
+	return 0
+}
+
+# --- install from tarball ---
+install_from_tarball() {
+	local name="$1" version="$2" top="${3:-0}"
+	local tarball="$PKG_DB/$name-$version.tar.gz"
+	local meta="$PKG_DB/$name-$version"
+	[ -f "$tarball" ] || die "no tarball for $name-$version (run bnd build first)"
+	[ -f "$meta/files" ] || die "no metadata for $name-$version"
+
+	local is_upgrade=0
+	is_installed "$name" && is_upgrade=1
+
+	resolve_conflicts "$name" "$meta/files"
+
+	local stage
+	stage=$(mktemp -d "$PKG_DB/.stage.XXXXXX")
+	tar -C "$stage" -xzf "$tarball" || { rm -rf "$stage"; die "extract failed: $name-$version"; }
+
+	local staged_count manifest_count
+	staged_count=$(find "$stage" \( -type f -o -type l \) | wc -l)
+	manifest_count=$(wc -l < "$meta/files")
+	if [ "$staged_count" -lt "$manifest_count" ]; then
+		rm -rf "$stage"
+		die "extracted $staged_count entries, manifest lists $manifest_count"
+	fi
+
+	run_hook pre-install "$name"
+
+	local new_files="$DB_DIR/.files.new" new_sums="$DB_DIR/.sums.new" new_modes="$DB_DIR/.modes.new"
+	_merge_stage "$stage" "$name" "$is_upgrade" "$new_files" "$new_sums" "$new_modes"
+	rm -rf "$stage"
+
+	[ "$is_upgrade" = "1" ] && remove_stale_files "$name" "$new_files"
+
+	mkdir -p "$INSTALLED_DB/$name"
+	mv "$new_files" "$INSTALLED_DB/$name/files"
+	mv "$new_sums"  "$INSTALLED_DB/$name/sums"
+	mv "$new_modes" "$INSTALLED_DB/$name/modes"
+	cp "$meta/build-env" "$INSTALLED_DB/$name/build-env"
+	printf '%s\n' "$version" > "$INSTALLED_DB/$name/version"
+
+	if [ "$top" = "1" ] || in_world "$name"; then
+		grep -qxF "$name" "$WORLD" 2>/dev/null || printf '%s\n' "$name" >> "$WORLD"
+	fi
+
+	_promote_alts "$name"
+	run_hook post-install "$name"
+	log_history "install" "$name" "$version"
+	_invalidate_rdeps
+	msg "installed $name-$version"
+}
+
+# --- install orchestration ---
+install_pkg() {
+	local pkg="$1" top="${2:-0}"
+	if [ -n "${_bnd_inflight[$pkg]:-}" ]; then
+		warn "circular dependency on $pkg, skipping"
+		return 0
+	fi
+	_bnd_inflight[$pkg]=1
+
+	local dir; dir=$(find_port "$pkg")
+	load_port "$dir"
+	local want_name="$name" want_ver="$version"
+	local bdeps=("${builddeps[@]}") deps=("${depends[@]}")
+	local d
+
+	for d in "${bdeps[@]}"; do
+		is_installed "$d" || { msg "builddep: $d"; install_pkg "$d" 0; }
+	done
+	for d in "${deps[@]}"; do
+		is_installed "$d" || { msg "dep: $d"; install_pkg "$d" 0; }
+	done
+
+	build_package "$dir"
+	install_from_tarball "$want_name" "$want_ver" "$top"
+
+	unset "_bnd_inflight[$pkg]"
+}
+
+# --- commands: install / build / reinstall ---
+cmd_install() {
+	need_root; init_dirs; acquire_lock
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd install <pkg>"
+	if is_installed "$pkg"; then warn "$pkg already installed"; return 0; fi
+	if [ "$DRY_RUN" = 1 ]; then
+		msg "[dry-run] would install $pkg and its deps"
+		return 0
+	fi
+	install_pkg "$pkg" 1
+}
+
+cmd_build() {
+	init_dirs; acquire_lock
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd build <pkg>"
+	if [ "$DRY_RUN" = 1 ]; then msg "[dry-run] would build $pkg"; return 0; fi
+	build_package "$(find_port "$pkg")"
+}
+
+cmd_reinstall() {
+	need_root; init_dirs; acquire_lock
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd reinstall <pkg>"
+	is_installed "$pkg" || die "$pkg is not installed"
+	if [ "$DRY_RUN" = 1 ]; then msg "[dry-run] would reinstall $pkg"; return 0; fi
+	install_pkg "$pkg" "$(in_world "$pkg" && echo 1 || echo 0)"
+}
+
+# --- commands: remove ---
+cmd_remove() {
+	need_root; init_dirs; acquire_lock
+	local force=0 pkg="" arg
+	for arg in "$@"; do
+		case "$arg" in
+			-f|--force) force=1;;
+			-*) die "unknown option: $arg";;
+			*) [ -z "$pkg" ] || die "too many arguments"; pkg="$arg";;
+		esac
+	done
+	[ -n "$pkg" ] || die "usage: bnd remove [-f] <pkg>"
+	is_installed "$pkg" || die "$pkg is not installed"
+
+	local rdeps=() r
+	while IFS= read -r r; do rdeps+=("$r"); done < <(reverse_deps "$pkg")
+	if [ "${#rdeps[@]}" -gt 0 ]; then
+		if [ "$force" -eq 0 ]; then
+			warn "these packages depend on $pkg:"
+			printf '  %s\n' "${rdeps[@]}" >&2
+			die "refusing to remove $pkg (use -f to override)"
+		fi
+		warn "removing $pkg despite dependents (forced)"
+	fi
+
+	if [ "$DRY_RUN" = 1 ]; then msg "[dry-run] would remove $pkg"; return 0; fi
+
+	run_hook pre-remove "$pkg"
+
+	local f d base="${BND_ROOT:-}"
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		rm -f "$BND_ROOT$f"
+		d=$(dirname "$BND_ROOT$f")
+		while [ "$d" != "/" ] && [ "$d" != "$base" ] && [ -d "$d" ]; do
+			rmdir "$d" 2>/dev/null || break
+			d=$(dirname "$d")
+		done
+	done < "$INSTALLED_DB/$pkg/files"
+
+	rm -rf "$INSTALLED_DB/$pkg"
+	if [ -f "$WORLD" ]; then
+		grep -vxF "$pkg" "$WORLD" > "$WORLD.tmp" || true; mv "$WORLD.tmp" "$WORLD"
+	fi
+	if [ -f "$PINNED" ]; then
+		grep -vxF "$pkg" "$PINNED" > "$PINNED.tmp" || true; mv "$PINNED.tmp" "$PINNED"
+	fi
+	_clear_alts_for "$pkg"
+
+	run_hook post-remove "$pkg"
+	log_history "remove" "$pkg" ""
+	_invalidate_rdeps
+	msg "removed $pkg"
+}
+
+# --- commands: upgrade ---
+_should_skip_rebuild() {
+	local pkg="$1" dir="$2"
+	is_installed "$pkg" || return 1
+	local recorded current
+	recorded=$(sed -n 's/^port-hash=//p' "$INSTALLED_DB/$pkg/build-env" 2>/dev/null || true)
+	[ -n "$recorded" ] || return 1
+	current=$(_port_hash "$dir")
+	[ "$recorded" = "$current" ]
+}
+
+cmd_upgrade() {
+	need_root; init_dirs; acquire_lock
+	local force=0 target="" arg
+	for arg in "$@"; do
+		case "$arg" in
+			-f|--force) force=1;;
+			-*) die "unknown option: $arg";;
+			*) [ -z "$target" ] || die "too many arguments"; target="$arg";;
+		esac
+	done
+
+	if [ -n "$target" ]; then
+		is_installed "$target" || die "$target is not installed"
+		if [ "$DRY_RUN" = 1 ]; then msg "[dry-run] would upgrade $target"; return 0; fi
+		msg "upgrading $target"
+		install_pkg "$target" "$(in_world "$target" && echo 1 || echo 0)"
+		return
+	fi
+
+	[ -s "$WORLD" ] || { warn "nothing installed"; return 0; }
+	local pkg dir
+	while IFS= read -r pkg; do
+		[ -n "$pkg" ] || continue
+		if [ "$force" -eq 0 ] && is_pinned "$pkg"; then
+			msg "skipping $pkg (pinned)"; continue
+		fi
+		if ! dir=$(find_port_quiet "$pkg"); then
+			warn "port for $pkg missing from tree, skipping"; continue
+		fi
+		if [ "$force" -eq 0 ] && _should_skip_rebuild "$pkg" "$dir"; then
+			msg "$pkg unchanged, skipping"; continue
+		fi
+		if [ "$DRY_RUN" = 1 ]; then msg "[dry-run] would upgrade $pkg"; continue; fi
+		msg "upgrading $pkg"
+		install_pkg "$pkg" 1
+	done < "$WORLD"
+}
+
+# --- commands: pin ---
+cmd_pin() {
+	need_root; init_dirs; acquire_lock
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd pin <pkg>"
+	is_installed "$pkg" || die "$pkg is not installed"
+	is_pinned "$pkg" && { warn "$pkg already pinned"; return 0; }
+	[ "$DRY_RUN" = 1 ] && { msg "[dry-run] would pin $pkg"; return 0; }
+	printf '%s\n' "$pkg" >> "$PINNED"
+	msg "pinned $pkg"
+}
+
+cmd_unpin() {
+	need_root; init_dirs; acquire_lock
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd unpin <pkg>"
+	is_pinned "$pkg" || die "$pkg is not pinned"
+	[ "$DRY_RUN" = 1 ] && { msg "[dry-run] would unpin $pkg"; return 0; }
+	grep -vxF "$pkg" "$PINNED" > "$PINNED.tmp" || true
+	mv "$PINNED.tmp" "$PINNED"
+	msg "unpinned $pkg"
+}
+
+# --- commands: why / orphans / depclean ---
+cmd_why() {
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd why <pkg>"
+	is_installed "$pkg" || die "$pkg is not installed"
+	if in_world "$pkg"; then
+		printf '%s is explicitly installed (in world)\n' "$pkg"
+	else
+		printf '%s was pulled in as a dependency\n' "$pkg"
+	fi
+	local rdeps=() r
+	while IFS= read -r r; do rdeps+=("$r"); done < <(reverse_deps "$pkg")
+	if [ "${#rdeps[@]}" -eq 0 ]; then
+		printf 'nothing depends on %s\n' "$pkg"
+	else
+		printf 'required by:\n'; printf '  %s\n' "${rdeps[@]}"
+	fi
+}
+
+cmd_orphans() {
+	build_rdeps_index
+	local pkg
+	while IFS= read -r pkg; do
+		in_world "$pkg" && continue
+		if [ -z "${_rdeps_index[$pkg]:-}" ]; then
+			printf '%s\n' "$pkg"
+		fi
+	done < <(list_installed)
+	return 0
+}
+
+cmd_depclean() {
+	need_root; init_dirs; acquire_lock
+	local pkgs=() p
+	local tmp; tmp=$(mktemp)
+	cmd_orphans > "$tmp"
+	while IFS= read -r p; do pkgs+=("$p"); done < "$tmp"
+	rm -f "$tmp"
+
+	if [ "${#pkgs[@]}" -eq 0 ]; then msg "no orphans"; return 0; fi
+	msg "removing ${#pkgs[@]} orphan(s):"
+	printf '  %s\n' "${pkgs[@]}" >&2
+	[ "$DRY_RUN" = 1 ] && { msg "[dry-run] would remove above"; return 0; }
+	for p in "${pkgs[@]}"; do
+		cmd_remove -f "$p" || warn "failed to remove $p"
+	done
+}
+
+# --- commands: provides / provide / unprovide ---
+cmd_provides() {
+	local path="${1:-}"
+	[ -n "$path" ] || die "usage: bnd provides <path>"
+	local pkg f
+	while IFS= read -r pkg; do
+		f="$INSTALLED_DB/$pkg/files"
+		[ -f "$f" ] || continue
+		grep -qxF "$path" "$f" 2>/dev/null && printf '%s\n' "$pkg"
+	done < <(list_installed)
+	return 0
+}
+
+cmd_provide() {
+	need_root; init_dirs; acquire_lock
+	local path="${1:-}" pkg="${2:-}"
+	[ -n "$path" ] && [ -n "$pkg" ] || die "usage: bnd provide <path> <pkg>"
+	[ "$DRY_RUN" = 1 ] && { msg "[dry-run] would make $pkg provider of $path"; return 0; }
+
+	if ! is_installed "$pkg"; then
+		awk -v p="$path" '$1 != p' "$ALT_WANT" > "$ALT_WANT.tmp" || true
+		mv "$ALT_WANT.tmp" "$ALT_WANT"
+		printf '%s %s\n' "$path" "$pkg" >> "$ALT_WANT"
+		msg "recorded: $path will be provided by $pkg once installed"
+		return 0
+	fi
+
+	local iver tarball
+	iver=$(cat "$INSTALLED_DB/$pkg/version")
+	tarball="$PKG_DB/$pkg-$iver.tar.gz"
+	[ -f "$tarball" ] || die "no tarball for $pkg-$iver"
+
+	local entries
+	entries=$(tar -tzf "$tarball") || die "cannot read tarball: $tarball"
+	if ! printf '%s\n' "$entries" | grep -qxF "./${path#/}" \
+	   && ! printf '%s\n' "$entries" | grep -qxF "${path#/}"; then
+		die "$pkg does not provide $path"
+	fi
+
+	local owner=""
+	owner=$(all_owned_files_quiet | awk -F '\t' -v p="$path" '$2 == p { print $1; exit }') || true
+	if [ -n "$owner" ] && [ "$owner" != "$pkg" ]; then
+		msg "taking $path from $owner"
+		_remove_from_owner "$owner" "$path"
+	fi
+
+	local tmp; tmp=$(mktemp -d)
+	tar -C "$tmp" -xzf "$tarball" "./${path#/}" 2>/dev/null \
+		|| tar -C "$tmp" -xzf "$tarball" "${path#/}" \
+		|| { rm -rf "$tmp"; die "extract failed: $path"; }
+
+	mkdir -p "$(dirname "$BND_ROOT$path")"
+	rm -f "$BND_ROOT$path"
+	cp -a "$tmp$path" "$BND_ROOT$path"
+	rm -rf "$tmp"
+
+	local pf="$INSTALLED_DB/$pkg/files" ps="$INSTALLED_DB/$pkg/sums" pm="$INSTALLED_DB/$pkg/modes"
+	grep -qxF "$path" "$pf" 2>/dev/null || printf '%s\n' "$path" >> "$pf"
+	awk -v p="$path" '$2 != p' "$ps" > "$ps.tmp" || true; mv "$ps.tmp" "$ps"
+	local h; h=$(_sha256_of "$BND_ROOT$path")
+	printf '%s  %s\n' "$h" "$path" >> "$ps"
+	if [ -f "$pm" ]; then
+		awk -v p="$path" '$2 != p' "$pm" > "$pm.tmp" || true; mv "$pm.tmp" "$pm"
+		printf '%s  %s\n' "$(_stat_mode "$BND_ROOT$path")" "$path" >> "$pm"
+	fi
+
+	_set_alt "$path" "$pkg"
+	log_history "provide" "$pkg" "$path"
+	_invalidate_rdeps
+	msg "$path now provided by $pkg"
+}
+
+cmd_unprovide() {
+	need_root; init_dirs; acquire_lock
+	local path="${1:-}"
+	[ -n "$path" ] || die "usage: bnd unprovide <path>"
+	[ "$DRY_RUN" = 1 ] && { msg "[dry-run] would drop alternative for $path"; return 0; }
+	local hit=0
+	if [ -f "$ALT" ] && grep -q "^${path} " "$ALT" 2>/dev/null; then
+		awk -v p="$path" '$1 != p' "$ALT" > "$ALT.tmp" && mv "$ALT.tmp" "$ALT"; hit=1
+	fi
+	if [ -f "$ALT_WANT" ] && grep -q "^${path} " "$ALT_WANT" 2>/dev/null; then
+		awk -v p="$path" '$1 != p' "$ALT_WANT" > "$ALT_WANT.tmp" && mv "$ALT_WANT.tmp" "$ALT_WANT"; hit=1
+	fi
+	[ "$hit" -eq 1 ] || die "no alternative for $path"
+	msg "dropped alternative for $path"
+}
+
+# --- commands: verify ---
+_verify_one() {
+	local pkg="$1" sums="$INSTALLED_DB/$pkg/sums" modes="$INSTALLED_DB/$pkg/modes"
+	[ -f "$sums" ] || { warn "$pkg: no sums recorded, skipping"; return 0; }
+	local bad=0 line expected path target actual want_mode got_mode
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		expected="${line%%  *}"
+		path="${line#*  }"
+		target="$BND_ROOT$path"
+		if [ ! -e "$target" ]; then
+			printf 'missing: %s:%s\n' "$pkg" "$path"; bad=1; continue
+		fi
+		actual=$(_sha256_of "$target")
+		if [ "$actual" != "$expected" ]; then
+			printf 'modified: %s:%s\n' "$pkg" "$path"; bad=1
+		fi
+		if [ -f "$modes" ]; then
+			want_mode=$(awk -v p="$path" '$2 == p { print $1; exit }' "$modes")
+			if [ -n "$want_mode" ]; then
+				got_mode=$(_stat_mode "$target")
+				if [ "$got_mode" != "$want_mode" ]; then
+					printf 'mode: %s:%s (%s != %s)\n' "$pkg" "$path" "$got_mode" "$want_mode"; bad=1
+				fi
+			fi
+		fi
+	done < "$sums"
+	if [ "$bad" -eq 0 ]; then
+		msg "$pkg: clean"; return 0
+	fi
+	return 1
+}
+
+cmd_verify() {
+	local target="${1:-}" bad=0 pkg
+	if [ -n "$target" ]; then
+		is_installed "$target" || die "$target is not installed"
+		_verify_one "$target" || bad=1
+		return "$bad"
+	fi
+	while IFS= read -r pkg; do
+		[ -n "$pkg" ] || continue
+		_verify_one "$pkg" || bad=1
+	done < <(list_installed)
+	return "$bad"
+}
+
+# --- commands: graph / rgraph ---
+_graph_rec() {
+	local pkg="$1" prefix="$2" depth="$3" seen="$4"
+	[ "$depth" -gt 20 ] && return 0
+	printf '%s%s\n' "$prefix" "$pkg"
+	case ",$seen," in *",$pkg,"*) printf '%s  (cycle)\n' "$prefix"; return 0;; esac
+	local dir; dir=$(find_port_quiet "$pkg") || return 0
+	load_port_safe "$dir" || return 0
+	local d
+	for d in "${depends[@]}" "${builddeps[@]}"; do
+		_graph_rec "$d" "$prefix  " $((depth+1)) "$seen,$pkg"
+	done
+	return 0
+}
+
+cmd_graph() {
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd graph <pkg>"
+	_graph_rec "$pkg" "" 0 ""
+}
+
+cmd_rgraph() {
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd rgraph <pkg>"
+	printf '%s\n' "$pkg"
+	local r
+	while IFS= read -r r; do
+		printf '  %s\n' "$r"
+	done < <(reverse_deps "$pkg")
+	return 0
+}
+
+# --- commands: diff / history / tree ---
+cmd_diff() {
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd diff <pkg>"
+	is_installed "$pkg" || die "$pkg is not installed"
+	local dir; dir=$(find_port "$pkg")
+	load_port "$dir"
+	local new="$PKG_DB/$name-$version/files"
+	if [ ! -f "$new" ]; then
+		msg "no built tarball for $name-$version; run 'bnd build $pkg' first"
+		return 0
+	fi
+	local old="$INSTALLED_DB/$pkg/files"
+	printf 'name:    %s\n' "$pkg"
+	printf 'old ver: %s\n' "$(cat "$INSTALLED_DB/$pkg/version")"
+	printf 'new ver: %s\n' "$version"
+	printf -- '--- added ---\n'
+	comm -13 <(sort "$old") <(sort "$new") | sed 's/^/  /'
+	printf -- '--- removed ---\n'
+	comm -23 <(sort "$old") <(sort "$new") | sed 's/^/  /'
+}
+
+cmd_history() {
+	local filter_pkg=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--pkg) filter_pkg="$2"; shift 2;;
+			*) die "unknown option: $1";;
+		esac
+	done
+	[ -f "$HISTORY" ] || return 0
+	if [ -n "$filter_pkg" ]; then
+		awk -F '\t' -v p="$filter_pkg" '$3 == p' "$HISTORY"
+	else
+		cat "$HISTORY"
+	fi
+}
+
+cmd_tree() {
+	local tree
+	local -a trees
+	IFS=':' read -ra trees <<< "$PORTS_PATH"
+	for tree in "${trees[@]}"; do
+		printf 'tree: %s\n' "$tree"
+		if [ -d "$tree/.git" ]; then
+			local rev dirty
+			rev=$(git -C "$tree" rev-parse --short HEAD 2>/dev/null || echo "?")
+			dirty=""
+			git -C "$tree" diff --quiet 2>/dev/null || dirty=" (dirty)"
+			printf '  rev: %s%s\n' "$rev" "$dirty"
+			printf '  last commit: %s\n' "$(git -C "$tree" log -1 --format=%cI 2>/dev/null || echo '?')"
+		else
+			printf '  (not a git repo)\n'
+		fi
+		printf '  ports: %s\n' "$(find "$tree" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l)"
+	done
+	if [ -f "$TREE_FROZEN" ]; then
+		printf 'tree is FROZEN (sync is disabled)\n'
+	fi
+	return 0
+}
+
+# --- commands: lint ---
+_lint_one() {
+	local dir="$1" issues=0
+	local base; base=$(basename "$dir")
+	if ! bash -n "$dir/port" 2>/dev/null; then
+		printf '%s: syntax error in port\n' "$base"; issues=$((issues+1))
+	fi
+	if ! load_port_safe "$dir"; then
+		printf '%s: cannot load port\n' "$base"; return 1
+	fi
+	[ -n "$name" ] && [ "$name" != "0" ] || { printf '%s: name not set\n' "$base"; issues=$((issues+1)); }
+	[ "$version" != "0" ] || { printf '%s: version not set\n' "$base"; issues=$((issues+1)); }
+	if [ -n "$source" ] && [ -z "$sha256" ]; then
+		printf '%s: source set but no sha256\n' "$base"; issues=$((issues+1))
+	fi
+	local d
+	for d in "${depends[@]}" "${builddeps[@]}"; do
+		find_port_quiet "$d" >/dev/null || { printf '%s: dep %s not found in tree\n' "$base" "$d"; issues=$((issues+1)); }
+	done
+	if declare -f install >/dev/null; then
+		local body; body=$(declare -f install)
+		if printf '%s\n' "$body" | grep -qE '(cp|mv|install|ln) +[^ ]+ +/(usr|etc|var|opt|bin|sbin|lib)/' \
+		   && ! printf '%s\n' "$body" | grep -q 'DESTDIR'; then
+			printf '%s: install() may write outside DESTDIR\n' "$base"; issues=$((issues+1))
+		fi
+	fi
+	if declare -f build >/dev/null; then
+		local body; body=$(declare -f build)
+		if printf '%s\n' "$body" | grep -qE '\$(RANDOM|date \+)'; then
+			printf '%s: build() may be nondeterministic\n' "$base"; issues=$((issues+1))
+		fi
+	fi
+	return $([ "$issues" -gt 0 ] && echo 1 || echo 0)
+}
+
+cmd_lint() {
+	local target="${1:-}" count=0 bad=0 dir
+	if [ -z "$target" ] || [ "$target" = "-a" ] || [ "$target" = "--all" ]; then
+		while IFS= read -r dir; do
+			[ -d "$dir" ] || continue
+			count=$((count+1))
+			if ! _lint_one "$dir"; then bad=$((bad+1)); fi
+		done < <(all_port_dirs)
+		msg "$count ports checked, $bad with issues"
+		return $([ "$bad" -eq 0 ] && echo 0 || echo 1)
+	fi
+	dir=$(find_port "$target")
+	_lint_one "$dir"
+}
+
+# --- commands: new ---
+cmd_new() {
+	local target="${1:-}"
+	[ -n "$target" ] || die "usage: bnd new <category>/<name>"
+	[ -t 0 ] || die "bnd new requires an interactive terminal"
+
+	local first_tree="${PORTS_PATH%%:*}"
+	local category="${target%%/*}" pkg="${target##*/}"
+	[ "$category" != "$target" ] || die "target must be <category>/<name>"
+	local dir="$first_tree/$category/$pkg"
+	[ -e "$dir" ] && die "already exists: $dir"
+
+	local src="" sha=""
+	printf 'source url (blank for none): ' >&2
+	read -r src
+	if [ -n "$src" ]; then
+		printf 'sha256 (blank to compute from url): ' >&2
+		read -r sha
+		if [ -z "$sha" ]; then
+			msg "downloading to compute sha256"
+			local tmp; tmp=$(mktemp)
+			curl -fL --retry 3 -o "$tmp" "$src" || die "fetch failed"
+			sha=$(_sha256_of "$tmp")
+			rm -f "$tmp"
+			msg "sha256: $sha"
+		fi
+	fi
+
+	[ "$DRY_RUN" = 1 ] && { msg "[dry-run] would create $dir"; return 0; }
+	mkdir -p "$dir"
+	{
+		printf 'name="%s"\n' "$pkg"
+		printf 'version="0.1"\n'
+		printf 'source="%s"\n' "$src"
+		printf 'sha256="%s"\n' "$sha"
+		printf 'depends=()\n\n'
+		printf 'build() {\n'
+		if [ -n "$src" ]; then
+			printf '\t./configure --prefix=/usr\n'
+			printf '\tmake\n'
+		else
+			printf '\tprintf "hello\\n" > %s\n' "$pkg"
+		fi
+		printf '}\n\n'
+		printf 'install() {\n'
+		printf '\tmkdir -p "$DESTDIR/usr/bin"\n'
+		if [ -n "$src" ]; then
+			printf '\tmake DESTDIR="$DESTDIR" install\n'
+		else
+			printf '\tcp %s "$DESTDIR/usr/bin/%s"\n' "$pkg" "$pkg"
+		fi
+		printf '}\n'
+	} > "$dir/port"
+	msg "created $dir/port"
+}
+
+# --- commands: search / list / info / flags ---
+cmd_search() {
+	local q="${1:-}"
+	local -a trees
+	IFS=':' read -ra trees <<< "$PORTS_PATH"
+	local tree
+	for tree in "${trees[@]}"; do
+		[ -d "$tree" ] || continue
+		find "$tree" -mindepth 2 -maxdepth 2 -type d -iname "*${q}*" -print \
+			| sed 's|.*/||' | sort -u
+	done | sort -u
+}
+
+cmd_list() {
+	[ -d "$INSTALLED_DB" ] || return 0
+	local d p mark
+	for d in "$INSTALLED_DB"/*/; do
+		[ -d "$d" ] || continue
+		p=$(basename "$d"); mark=" "
+		is_pinned "$p" && mark="*"
+		printf '%s %-23s %s\n' "$mark" "$p" "$(cat "$d/version" 2>/dev/null)"
+	done
+	return 0
+}
+
+cmd_info() {
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd info <pkg>"
+	is_installed "$pkg" || die "$pkg is not installed"
+	local db="$INSTALLED_DB/$pkg"
+	printf 'name:    %s\n' "$pkg"
+	printf 'version: %s\n' "$(cat "$db/version")"
+	printf 'files:   %s\n' "$(wc -l < "$db/files")"
+	printf 'pinned:  %s\n' "$(is_pinned "$pkg" && echo yes || echo no)"
+	printf 'world:   %s\n' "$(in_world "$pkg" && echo yes || echo no)"
+	if [ -f "$db/build-env" ]; then
+		printf 'built:   %s\n' "$(sed -n 's/^built=//p'     "$db/build-env")"
+		printf 'cflags:  %s\n' "$(sed -n 's/^CFLAGS=//p'    "$db/build-env")"
+		printf 'cxxflg:  %s\n' "$(sed -n 's/^CXXFLAGS=//p'  "$db/build-env")"
+		printf 'ldflags: %s\n' "$(sed -n 's/^LDFLAGS=//p'   "$db/build-env")"
+		printf 'jobs:    %s\n' "$(sed -n 's/^MAKEJOBS=//p'  "$db/build-env")"
+	fi
+}
+
+cmd_flags() {
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd flags <pkg>"
+	is_installed "$pkg" || die "$pkg is not installed"
+	local f="$INSTALLED_DB/$pkg/build-env"
+	[ -f "$f" ] || die "no build-env recorded for $pkg"
+	cat "$f"
+}
+
+# --- commands: doctor ---
+cmd_doctor() {
+	init_dirs
+	local fix=0
+	[ "${1:-}" = "--fix" ] && fix=1
+	local issues=0 pkg
+
+	local world_tmp="" pinned_tmp="" alt_tmp=""
+	if [ "$fix" = 1 ]; then
+		world_tmp=$(mktemp)
+		pinned_tmp=$(mktemp)
+		alt_tmp=$(mktemp)
+	fi
+
+	# world
+	while IFS= read -r pkg; do
+		[ -n "$pkg" ] || continue
+		if is_installed "$pkg"; then
+			[ -n "$world_tmp" ] && printf '%s\n' "$pkg" >> "$world_tmp"
+		else
+			printf 'world: %s listed but not installed\n' "$pkg"
+			issues=$((issues+1))
+		fi
+	done < "$WORLD"
+	[ -n "$world_tmp" ] && mv "$world_tmp" "$WORLD"
+
+	# pinned
+	while IFS= read -r pkg; do
+		[ -n "$pkg" ] || continue
+		if is_installed "$pkg"; then
+			[ -n "$pinned_tmp" ] && printf '%s\n' "$pkg" >> "$pinned_tmp"
+		else
+			printf 'pinned: %s listed but not installed\n' "$pkg"
+			issues=$((issues+1))
+		fi
+	done < "$PINNED"
+	[ -n "$pinned_tmp" ] && mv "$pinned_tmp" "$PINNED"
+
+	# alternatives
+	local path owner
+	while IFS=' ' read -r path owner; do
+		[ -n "$owner" ] || continue
+		if is_installed "$owner"; then
+			[ -n "$alt_tmp" ] && printf '%s %s\n' "$path" "$owner" >> "$alt_tmp"
+		else
+			printf 'alternative: %s -> %s (not installed)\n' "$path" "$owner"
+			issues=$((issues+1))
+		fi
+	done < "$ALT"
+	[ -n "$alt_tmp" ] && mv "$alt_tmp" "$ALT"
+
+	# metadata completeness
+	while IFS= read -r pkg; do
+		local db="$INSTALLED_DB/$pkg"
+		local f
+		for f in version files sums; do
+			if [ ! -f "$db/$f" ]; then
+				printf 'metadata: %s missing %s\n' "$pkg" "$f"
+				issues=$((issues+1))
+			fi
+		done
+	done < <(list_installed)
+
+	# leftover staging
+	local leftover
+	leftover=$(find "$PKG_DB" -maxdepth 1 -name '.stage.*' 2>/dev/null | wc -l)
+	if [ "$leftover" -gt 0 ]; then
+		printf 'staging: %s leftover .stage dirs\n' "$leftover"
+		[ "$fix" = 1 ] && rm -rf "$PKG_DB"/.stage.*
+		issues=$((issues+1))
+	fi
+
+	# leftover build wrappers / homes
+	local build_leaks
+	build_leaks=$(find "$DB_DIR" -maxdepth 1 \
+		\( -name '.buildhome.*' -o -name '.build-wrapper.sh.*' \) \
+		2>/dev/null | wc -l)
+	if [ "$build_leaks" -gt 0 ]; then
+		printf 'build: %s leftover wrapper/home dirs\n' "$build_leaks"
+		if [ "$fix" = 1 ]; then
+			find "$DB_DIR" -maxdepth 1 \
+				\( -name '.buildhome.*' -o -name '.build-wrapper.sh.*' \) \
+				-exec rm -rf {} + 2>/dev/null || true
+		fi
+		issues=$((issues+1))
+	fi
+
+	if [ "$issues" -eq 0 ]; then
+		msg "no issues found"
+	else
+		if [ "$fix" = 1 ]; then
+			msg "$issues issue(s) found, auto-fixable ones applied"
+		else
+			msg "$issues issue(s) found (run with --fix to auto-repair)"
+		fi
+	fi
+	return 0
+}
+
+# --- commands: clean ---
+cmd_clean() {
+	if [ "${1:-}" = "-a" ] || [ "${1:-}" = "--all" ]; then
+		[ "$DRY_RUN" = 1 ] && { msg "[dry-run] would clean all"; return 0; }
+		rm -rf "${PKG_DB:?}"/* 2>/dev/null || true
+		local d
+		while IFS= read -r d; do
+			[ -d "$d" ] || continue
+			rm -rf "$d/work" "$d/dist"
+		done < <(all_port_dirs)
+		msg "cleaned all"
+		return
+	fi
+	local pkg="${1:-}"
+	[ -n "$pkg" ] || die "usage: bnd clean [-a|<pkg>]"
+	local dir; dir=$(find_port "$pkg")
+	[ "$DRY_RUN" = 1 ] && { msg "[dry-run] would clean $pkg"; return 0; }
+	rm -rf "$dir/work" "$dir/dist"
+	rm -f "$PKG_DB/$pkg-"*.tar.gz 2>/dev/null || true
+	find "$PKG_DB" -maxdepth 1 -type d -name "$pkg-*" -exec rm -rf {} + 2>/dev/null || true
+	msg "cleaned $pkg"
+}
+
+# --- commands: sync ---
+cmd_sync() {
+	need_root; acquire_lock
+	local commit="" do_freeze=0 do_unfreeze=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--commit) commit="$2"; shift 2;;
+			--freeze) do_freeze=1; shift;;
+			--unfreeze) do_unfreeze=1; shift;;
+			*) die "unknown option: $1";;
+		esac
+	done
+
+	if [ "$do_freeze" = 1 ]; then
+		touch "$TREE_FROZEN"; msg "tree frozen"; return 0
+	fi
+	if [ "$do_unfreeze" = 1 ]; then
+		rm -f "$TREE_FROZEN"; msg "tree unfrozen"; return 0
+	fi
+	if [ -f "$TREE_FROZEN" ]; then
+		warn "tree is frozen; use --unfreeze to re-enable sync"
+		return 0
+	fi
+
+	local tree
+	local -a trees
+	IFS=':' read -ra trees <<< "$PORTS_PATH"
+	for tree in "${trees[@]}"; do
+		[ -d "$tree/.git" ] || { warn "not a git repo: $tree"; continue; }
+		msg "syncing $tree"
+		if [ "$DRY_RUN" = 1 ]; then
+			msg "[dry-run] would pull $tree${commit:+ to $commit}"
+			continue
+		fi
+		if [ -n "$commit" ]; then
+			git -C "$tree" fetch --all
+			git -C "$tree" checkout "$commit"
+		else
+			git -C "$tree" pull --ff-only
+		fi
+	done
+	return 0
+}
+
+# --- arg parsing and dispatch ---
+main() {
+	load_conf
+
+	local -a raw=("$@") args=()
+	local i=0 arg have_root=0 root_val=""
+	while [ "$i" -lt "${#raw[@]}" ]; do
+		arg="${raw[$i]}"
+		case "$arg" in
+			--root)
+				i=$((i+1))
+				[ "$i" -lt "${#raw[@]}" ] || die "--root requires a value"
+				root_val="${raw[$i]}"; have_root=1
+				;;
+			--root=*) root_val="${arg#--root=}"; have_root=1;;
+			--dry-run|-n) DRY_RUN=1;;
+			*) args+=("$arg");;
+		esac
+		i=$((i+1))
+	done
+	[ "$have_root" -eq 0 ] || BND_ROOT="$root_val"
+
+	set -- "${args[@]+"${args[@]}"}"
+
+	local cmd="${1:-help}"; shift || true
+	case "$cmd" in
+		install)              cmd_install "$@";;
+		build)                cmd_build "$@";;
+		reinstall)            cmd_reinstall "$@";;
+		remove|uninstall|rm)  cmd_remove "$@";;
+		upgrade)              cmd_upgrade "$@";;
+		pin)                  cmd_pin "$@";;
+		unpin)                cmd_unpin "$@";;
+		why)                  cmd_why "$@";;
+		orphans)              cmd_orphans "$@";;
+		depclean)             cmd_depclean "$@";;
+		provides|owner)       cmd_provides "$@";;
+		provide)              cmd_provide "$@";;
+		unprovide)            cmd_unprovide "$@";;
+		verify)               cmd_verify "$@";;
+		graph)                cmd_graph "$@";;
+		rgraph)               cmd_rgraph "$@";;
+		diff)                 cmd_diff "$@";;
+		history)              cmd_history "$@";;
+		tree)                 cmd_tree "$@";;
+		lint)                 cmd_lint "$@";;
+		new)                  cmd_new "$@";;
+		doctor)               cmd_doctor "$@";;
+		clean)                cmd_clean "$@";;
+		search)               cmd_search "$@";;
+		list)                 cmd_list "$@";;
+		info)                 cmd_info "$@";;
+		flags)                cmd_flags "$@";;
+		sync)                 cmd_sync "$@";;
+		help|-h|--help)       usage;;
+		*)                    usage; exit 1;;
+	esac
+}
+
+main "$@"
