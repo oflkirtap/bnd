@@ -499,8 +499,9 @@ run_hook() {
 
 # --- source prep ---
 prepare_src() {
-	local work="$port_dir/work" marker="$work/.bnd-extracted"
-	if [ ! -f "$marker" ]; then
+    local work="$port_dir/work"
+    local marker="$work/.bnd-extracted"
+    if [ ! -f "$marker" ]; then
 		rm -rf "$work"; mkdir -p "$work"
 		if [ -n "$source" ]; then
 			mkdir -p "$port_dir/dist"
