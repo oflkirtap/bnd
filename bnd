@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# a "simple" ports-based package manager
-# v1.0.1
+# bnd - boundary, a ports-based package manager
+# v1.0.2 - adds CC/CXX env propagation for KISS-style ports
 #
 # requires bash 4.4+ (associative arrays, mapfile, [[ ]], process substitution)
 #
 # layout summary
-# --- 
+# --------------
 # ports tree (one or more, searched in $PORTS_PATH order):
 #   <tree>/<category>/<name>/
 #     port          build script: metadata + build() + install()
@@ -13,6 +13,7 @@
 #     builddeps     optional: build-only deps, one per line
 #     env           optional: env vars sourced inside build context
 #     patches/      optional: *.patch applied after extract, in sort order
+#     files/        optional: static files copied by build()/install()
 #     dist/         cached source tarball (auto)
 #     work/         extracted source; build() runs here (auto)
 #
@@ -24,7 +25,7 @@
 #   .lock, .tree-frozen
 #
 # config: $BND_CONF (default /etc/bnd.conf)
-#   CFLAGS CXXFLAGS LDFLAGS MAKEJOBS
+#   CFLAGS CXXFLAGS LDFLAGS MAKEJOBS CC CXX
 #   BND_BUILD_USER            drop build() to this user when running as root
 #   BND_HOOK                  hook script: $BND_HOOK <phase> <pkg>
 #   BND_CCACHE=1              prepend ccache to CC/CXX
@@ -33,12 +34,12 @@
 
 set -euo pipefail
 
-BND_VER="1.0.1"
+BND_VER="1.0.2"
 
 # --- constants ---
 PORTS_PATH="${PORTS_PATH:-/usr/ports}"
 DB_DIR="${DB_DIR:-/var/db/bnd}"
-BND_ROOT="${BND_ROOT:-/}"
+BND_ROOT="${BND_ROOT:-}"
 BND_CONF="${BND_CONF:-/etc/bnd.conf}"
 
 INSTALLED_DB="$DB_DIR/installed"
@@ -125,7 +126,7 @@ options:
   --dry-run            print what would happen, change nothing
 
 config: $BND_CONF
-  CFLAGS CXXFLAGS LDFLAGS MAKEJOBS
+  CFLAGS CXXFLAGS LDFLAGS MAKEJOBS CC CXX
   BND_BUILD_USER BND_HOOK BND_CCACHE BND_SANDBOX BND_SANDBOX_ISOLATE_NET
 EOF
 }
@@ -203,9 +204,11 @@ all_port_dirs() {
 load_conf() {
 	local e_cflags="${CFLAGS-__UNSET__}" e_cxx="${CXXFLAGS-__UNSET__}"
 	local e_ldflags="${LDFLAGS-__UNSET__}" e_jobs="${MAKEJOBS-__UNSET__}"
+	local e_cc="${CC-__UNSET__}" e_ccxx="${CXX-__UNSET__}"
 
 	CFLAGS="-O2 -pipe"; CXXFLAGS="-O2 -pipe"; LDFLAGS=""
 	MAKEJOBS="$(_cpu_count)"
+	CC="cc"; CXX="c++"
 
 	if [ -f "$BND_CONF" ]; then
 		# shellcheck disable=SC1090
@@ -216,15 +219,17 @@ load_conf() {
 	[ "$e_cxx"     = "__UNSET__" ] || CXXFLAGS="$e_cxx"
 	[ "$e_ldflags" = "__UNSET__" ] || LDFLAGS="$e_ldflags"
 	[ "$e_jobs"    = "__UNSET__" ] || MAKEJOBS="$e_jobs"
+	[ "$e_cc"      = "__UNSET__" ] || CC="$e_cc"
+	[ "$e_ccxx"    = "__UNSET__" ] || CXX="$e_ccxx"
 
-	export CFLAGS CXXFLAGS LDFLAGS MAKEJOBS
+	export CFLAGS CXXFLAGS LDFLAGS MAKEJOBS CC CXX
 	export MAKEFLAGS="-j$MAKEJOBS"
 
 	_init_sha_tool
 
 	if [ "${BND_CCACHE:-0}" = "1" ] && command -v ccache >/dev/null 2>&1; then
-		export CC="ccache ${CC:-cc}"
-		export CXX="ccache ${CXX:-c++}"
+		export CC="ccache $CC"
+		export CXX="ccache $CXX"
 	fi
 
 	if [ -n "${BND_BUILD_USER:-}" ] && ! id "$BND_BUILD_USER" >/dev/null 2>&1; then
@@ -549,6 +554,8 @@ _run_build_bwrap() {
 			--setenv CFLAGS "$CFLAGS" \
 			--setenv CXXFLAGS "$CXXFLAGS" \
 			--setenv LDFLAGS "$LDFLAGS" \
+			--setenv CC "$CC" \
+			--setenv CXX "$CXX" \
 			--setenv MAKEJOBS "$MAKEJOBS" \
 			--setenv MAKEFLAGS "$MAKEFLAGS" \
 			--setenv HOME "$home" \
@@ -582,11 +589,13 @@ _run_build_user() {
 	if command -v runuser >/dev/null 2>&1; then
 		( cd "$work" && runuser -u "$BND_BUILD_USER" -- env \
 			CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS" LDFLAGS="$LDFLAGS" \
+			CC="$CC" CXX="$CXX" \
 			MAKEJOBS="$MAKEJOBS" MAKEFLAGS="$MAKEFLAGS" HOME="$home" \
 			"$wrapper" "$envfile" "$portfile" ) || rc=$?
 	elif command -v sudo >/dev/null 2>&1; then
 		( cd "$work" && sudo -u "$BND_BUILD_USER" env \
 			CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS" LDFLAGS="$LDFLAGS" \
+			CC="$CC" CXX="$CXX" \
 			MAKEJOBS="$MAKEJOBS" MAKEFLAGS="$MAKEFLAGS" HOME="$home" \
 			"$wrapper" "$envfile" "$portfile" ) || rc=$?
 	else
@@ -686,6 +695,8 @@ build_package() {
 		printf 'CFLAGS=%s\n'    "$CFLAGS"
 		printf 'CXXFLAGS=%s\n'  "$CXXFLAGS"
 		printf 'LDFLAGS=%s\n'   "$LDFLAGS"
+		printf 'CC=%s\n'        "$CC"
+		printf 'CXX=%s\n'       "$CXX"
 		printf 'MAKEJOBS=%s\n'  "$MAKEJOBS"
 		printf 'port-hash=%s\n' "$phash"
 		printf 'built=%s\n'     "$(_iso_now)"
@@ -1407,6 +1418,8 @@ cmd_info() {
 		printf 'cflags:  %s\n' "$(sed -n 's/^CFLAGS=//p'    "$db/build-env")"
 		printf 'cxxflg:  %s\n' "$(sed -n 's/^CXXFLAGS=//p'  "$db/build-env")"
 		printf 'ldflags: %s\n' "$(sed -n 's/^LDFLAGS=//p'   "$db/build-env")"
+		printf 'cc:      %s\n' "$(sed -n 's/^CC=//p'        "$db/build-env")"
+		printf 'cxx:     %s\n' "$(sed -n 's/^CXX=//p'       "$db/build-env")"
 		printf 'jobs:    %s\n' "$(sed -n 's/^MAKEJOBS=//p'  "$db/build-env")"
 	fi
 }
